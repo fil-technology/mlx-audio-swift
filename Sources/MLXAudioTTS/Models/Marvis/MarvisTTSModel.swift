@@ -206,8 +206,13 @@ public extension MarvisTTSModel {
         }
         
         let parameters = ModuleParameters.unflattened(weights)
-        try model.update(parameters: parameters, verify: .all)
-        
+        // NOTE: not `.all`. CSMLlama3ScaledRoPE precomputes cos/sin caches that
+        // MLX reflects as module parameters, but the checkpoint has no such
+        // keys — `.allModelKeysSet` then fails loading with a misleading
+        // "Key ...CSMllama3ScaledRoPE" error. Keep the checks that catch real
+        // problems (unexpected checkpoint keys, shape mismatches).
+        try model.update(parameters: parameters, verify: [.noUnusedKeys, .shapeMismatch])
+
         eval(model)
         return model
     }

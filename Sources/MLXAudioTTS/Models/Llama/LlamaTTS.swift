@@ -957,7 +957,10 @@ public class LlamaTTSModel: Module, KVCacheDimensionProvider, SpeechGenerationMo
             }
         }
 
-        try model.update(parameters: ModuleParameters.unflattened(sanitizedWeights), verify: .all)
+        // Not `.all`: Llama3ScaledRoPE precomputes cos/sin caches reflected as
+        // module parameters that the checkpoint doesn't contain, so
+        // `.allModelKeysSet` would fail with a misleading RoPE key error.
+        try model.update(parameters: ModuleParameters.unflattened(sanitizedWeights), verify: [.noUnusedKeys, .shapeMismatch])
         eval(model)
 
         try await model.post_load_hook(model: model, modelDir: modelDir, cache: cache)
