@@ -21,7 +21,7 @@ struct TTSModelRegistryEntry {
     }
 }
 
-enum TTSModelRegistry {
+public enum TTSModelRegistry {
     static let entries: [TTSModelRegistryEntry] = [
         .init(
             canonicalType: "qwen3_tts",
@@ -77,8 +77,70 @@ enum TTSModelRegistry {
             loader: { modelRepo, cache in
                 try await KittenTTSModel.fromPretrained(modelRepo, cache: cache)
             }
+        ),
+        .init(
+            canonicalType: "moss_tts_nano",
+            aliases: ["moss-tts-nano", "moss_tts", "moss"],
+            repoMatchers: ["moss-tts-nano", "moss_tts_nano"],
+            loader: { modelRepo, cache in
+                let model = try await MossTTSNanoModel.fromPretrained(modelRepo, cache: cache)
+                // MOSS keeps its codec in a separate repo, so the decoder is
+                // fetched and attached here rather than by the model loader.
+                //
+                // The published config names the *PyTorch* codec repo
+                // (`OpenMOSS-Team/...`), whose remote-code weights this loader
+                // cannot read, so honour it only when it already points at an
+                // MLX conversion and otherwise use the mlx-community build.
+                let configured = model.config.audioTokenizerRepo
+                let repo = (configured?.lowercased().contains("mlx") == true)
+                    ? configured!
+                    : "mlx-community/MOSS-Audio-Tokenizer-Nano"
+                let decoder = try await MossAudioTokenizerModel.fromPretrained(repo, cache: cache)
+                model.attach(audioDecoder: decoder)
+                return model
+            }
         )
     ]
+
+    /// Canonical loader type for a model, or `nil` when nothing here can load
+    /// it.
+    ///
+    /// Exposed so callers (notably TTSMLX's model store) can ask *this* table
+    /// whether a model is runnable, instead of keeping a parallel copy that
+    /// silently goes stale — a model missing from such a copy reports as
+    /// "unsupported by the current MLX runtime" even though the loader exists.
+    ///
+    /// - Parameters:
+    ///   - modelType: `model_type` from the model's `config.json`, if known.
+    ///   - architectures: `architectures` from `config.json`, if known.
+    ///   - repo: repository id, used only as a last-resort hint.
+    public static func canonicalModelType(
+        modelType: String? = nil,
+        architectures: [String] = [],
+        repo: String? = nil
+    ) -> String? {
+        if let normalized = normalizedModelType(modelType) {
+            return normalized
+        }
+        for architecture in architectures {
+            let lowered = architecture.lowercased()
+            if let match = entries.first(where: { entry in
+                entry.aliases.contains(where: { lowered.contains($0.replacingOccurrences(of: "_", with: "")) })
+                    || entry.repoMatchers.contains(where: { lowered.contains($0.replacingOccurrences(of: "_", with: "")) })
+            }) {
+                return match.canonicalType
+            }
+        }
+        if let repo {
+            return inferModelType(from: repo)
+        }
+        return nil
+    }
+
+    /// Every loader type this build can route to.
+    public static var supportedModelTypes: [String] {
+        entries.map(\.canonicalType)
+    }
 
     static func normalizedModelType(_ modelType: String?) -> String? {
         guard let modelType else { return nil }
