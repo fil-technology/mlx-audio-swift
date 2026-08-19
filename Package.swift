@@ -57,14 +57,13 @@ let package = Package(
 
     ],
     dependencies: [
-        // The background-safe fork, not upstream. Upstream publishes the same
-        // version tags, so when both URLs appear in one graph SwiftPM resolves
-        // the shared `mlx-swift` identity to whichever it sees first — and a
-        // consumer can silently end up on upstream, losing the Metal
-        // check_error patch that keeps the app alive when iOS revokes GPU
-        // access on backgrounding. Naming the fork here removes one of the two
-        // conflicting declarations. See Docs/mlx-swift-bg-safe-fork.md in TTSMLX.
-        .package(url: "https://github.com/fil-technology/mlx-swift.git", .upToNextMinor(from: "0.31.5")),
+        // Deliberately upstream, not fil-technology/mlx-swift. Naming the fork
+        // here does not remove the conflict — mlx-swift-lm still declares
+        // upstream — it only moves the warning into this package. Consumers
+        // that need the background-safe fork redirect it with a SwiftPM
+        // mirror, which rewrites every declaration at once. See
+        // Tools/verify-mlx-fork.sh in TTSMLX for the check that it took.
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "2.30.3")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
