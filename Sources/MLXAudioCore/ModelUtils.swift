@@ -26,12 +26,16 @@ public enum ModelUtils {
     ///   - string: The repository name
     ///   - requiredExtension: File extension that must exist for cache to be considered complete (e.g., "safetensors")
     ///   - hfToken: The huggingface token for access to gated repositories, if needed.
+    ///   - additionalPatterns: Extra glob patterns to fetch alongside the
+    ///     defaults, e.g. `["*.model"]` for a SentencePiece `tokenizer.model`.
+    ///     Opt-in so existing models keep their current download footprint.
     /// - Returns: The model directory URL
     public static func resolveOrDownloadModel(
         repoID: Repo.ID,
         requiredExtension: String,
         hfToken: String? = nil,
-        cache: HubCache = .default
+        cache: HubCache = .default,
+        additionalPatterns: [String] = []
     ) async throws -> URL {
         let client: HubClient
         if let token = hfToken, !token.isEmpty {
@@ -45,7 +49,8 @@ public enum ModelUtils {
             client: client,
             cache: resolvedCache,
             repoID: repoID,
-            requiredExtension: requiredExtension
+            requiredExtension: requiredExtension,
+            additionalPatterns: additionalPatterns
         )
     }
 
@@ -55,12 +60,14 @@ public enum ModelUtils {
     ///   - cache: The HuggingFace cache
     ///   - repoID: The repository ID
     ///   - requiredExtension: File extension that must exist for cache to be considered complete (e.g., "safetensors")
+    ///   - additionalPatterns: Extra glob patterns to fetch alongside the defaults.
     /// - Returns: The model directory URL
     public static func resolveOrDownloadModel(
         client: HubClient,
         cache: HubCache = .default,
         repoID: Repo.ID,
-        requiredExtension: String
+        requiredExtension: String,
+        additionalPatterns: [String] = []
     ) async throws -> URL {
         let normalizedRequiredExtension = requiredExtension.hasPrefix(".")
             ? String(requiredExtension.dropFirst())
@@ -87,8 +94,21 @@ public enum ModelUtils {
                 if FileManager.default.fileExists(atPath: configPath.path) {
                     if let configData = try? Data(contentsOf: configPath),
                        let _ = try? JSONSerialization.jsonObject(with: configData) {
-                        print("Using cached model at: \(modelDir.path)")
-                        return modelDir
+                        // A cached directory populated by an earlier call that
+                        // did NOT request these patterns is missing files this
+                        // caller needs (e.g. a SentencePiece `tokenizer.model`
+                        // fetched only by the MOSS loader). Fall through to
+                        // download so the snapshot fills the gaps — deliberately
+                        // WITHOUT clearing, which would re-fetch gigabytes of
+                        // weights that are already present and valid.
+                        let missing = additionalPatterns.filter { pattern in
+                            !(files ?? []).contains { Self.filename($0, matches: pattern) }
+                        }
+                        if missing.isEmpty {
+                            print("Using cached model at: \(modelDir.path)")
+                            return modelDir
+                        }
+                        print("Cached model is missing \(missing.joined(separator: ", ")); fetching those files...")
                     } else {
                         print("Cached config.json is invalid, clearing cache...")
                         Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
@@ -103,7 +123,8 @@ public enum ModelUtils {
         // Create directory if needed
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
 
-        let allowedExtensions: Set<String> = ["*.\(normalizedRequiredExtension)", "*.safetensors", "*.json", "*.txt", "*.wav"]
+        var allowedExtensions: Set<String> = ["*.\(normalizedRequiredExtension)", "*.safetensors", "*.json", "*.txt", "*.wav"]
+        allowedExtensions.formUnion(additionalPatterns)
 
         print("Downloading model \(repoID)...")
         _ = try await client.downloadSnapshot(
@@ -134,6 +155,16 @@ public enum ModelUtils {
 
         print("Model downloaded to: \(modelDir.path)")
         return modelDir
+    }
+
+    /// Glob match on the last path component, so callers can express
+    /// requirements the way `downloadSnapshot(matching:)` does.
+    private static func filename(_ url: URL, matches pattern: String) -> Bool {
+        url.lastPathComponent.withCString { name in
+            pattern.withCString { glob in
+                fnmatch(glob, name, 0) == 0
+            }
+        }
     }
 
     private static func clearCaches(modelDir: URL, repoID: Repo.ID, hubCache: HubCache) {

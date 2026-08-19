@@ -103,7 +103,11 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
-            path: "Sources/MLXAudioTTS"
+            path: "Sources/MLXAudioTTS",
+            resources: [
+                // Pre-encoded MOSS-TTS-Nano reference clips; see MossVoicePack.
+                .copy("Resources/MossVoices")
+            ]
         ),
 
         // MARK: - MLXAudioSTT

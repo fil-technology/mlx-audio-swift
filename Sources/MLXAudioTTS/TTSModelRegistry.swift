@@ -77,6 +77,28 @@ enum TTSModelRegistry {
             loader: { modelRepo, cache in
                 try await KittenTTSModel.fromPretrained(modelRepo, cache: cache)
             }
+        ),
+        .init(
+            canonicalType: "moss_tts_nano",
+            aliases: ["moss-tts-nano", "moss_tts", "moss"],
+            repoMatchers: ["moss-tts-nano", "moss_tts_nano"],
+            loader: { modelRepo, cache in
+                let model = try await MossTTSNanoModel.fromPretrained(modelRepo, cache: cache)
+                // MOSS keeps its codec in a separate repo, so the decoder is
+                // fetched and attached here rather than by the model loader.
+                //
+                // The published config names the *PyTorch* codec repo
+                // (`OpenMOSS-Team/...`), whose remote-code weights this loader
+                // cannot read, so honour it only when it already points at an
+                // MLX conversion and otherwise use the mlx-community build.
+                let configured = model.config.audioTokenizerRepo
+                let repo = (configured?.lowercased().contains("mlx") == true)
+                    ? configured!
+                    : "mlx-community/MOSS-Audio-Tokenizer-Nano"
+                let decoder = try await MossAudioTokenizerModel.fromPretrained(repo, cache: cache)
+                model.attach(audioDecoder: decoder)
+                return model
+            }
         )
     ]
 
