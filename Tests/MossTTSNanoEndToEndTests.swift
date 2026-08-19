@@ -44,14 +44,15 @@ struct MossTTSNanoEndToEndTests {
         audio.eval()
         let elapsed = Date().timeIntervalSince(started)
 
-        #expect(audio.ndim == 2, "expected [samples, channels], got \(audio.shape)")
-        #expect(audio.dim(1) == 2, "MOSS decodes 48 kHz stereo")
+        // The codec decodes 48 kHz stereo, but SpeechGenerationModel is a mono
+        // contract, so the model downmixes before returning.
+        #expect(audio.ndim == 1, "expected mono samples, got \(audio.shape)")
 
         let seconds = Double(audio.dim(0)) / 48000.0
         // ~250 characters of news copy should land in a broad but sane window.
         #expect(seconds > 4.0 && seconds < 45.0, "generated \(seconds)s")
 
-        let channel0 = audio[0..., 0].asType(.float32)
+        let channel0 = audio.asType(.float32)
         let rms = MLX.sqrt((channel0 * channel0).mean()).item(Float.self)
         #expect(rms > 0.005, "audio is silent (rms \(rms))")
         #expect(rms < 1.0, "audio is clipping (rms \(rms))")
@@ -62,16 +63,16 @@ struct MossTTSNanoEndToEndTests {
         let destination = ProcessInfo.processInfo.environment["MOSS_E2E_OUTPUT"]
             .map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.temporaryDirectory.appendingPathComponent("moss_e2e.wav")
-        try Self.writeStereoWAV(audio, sampleRate: 48000, to: destination)
+        try Self.writeWAV(audio, sampleRate: 48000, to: destination)
         let peakMB = Double(MLX.GPU.peakMemory) / 1_048_576.0
         print("[moss-e2e] \(seconds)s of audio in \(elapsed)s (RTF \(seconds / elapsed)x), peak \(peakMB) MB -> \(destination.path)")
     }
 
-    /// Minimal 16-bit PCM stereo WAV writer. `saveAudioArray` in MLXAudioCore
-    /// is mono-only and not public, and MOSS decodes to 48 kHz stereo.
-    static func writeStereoWAV(_ audio: MLXArray, sampleRate: Int, to url: URL) throws {
+    /// Minimal 16-bit PCM WAV writer; `saveAudioArray` in MLXAudioCore is not
+    /// public. Handles mono or interleaved multi-channel input.
+    static func writeWAV(_ audio: MLXArray, sampleRate: Int, to url: URL) throws {
         let frames = audio.dim(0)
-        let channels = audio.dim(1)
+        let channels = audio.ndim > 1 ? audio.dim(1) : 1
         let interleaved = audio.asType(.float32).asArray(Float.self)
 
         var data = Data()
@@ -211,6 +212,6 @@ struct MossTTSNanoEndToEndTests {
         )
         audio.eval()
         #expect(audio.dim(0) > 0, "nil voice produced no audio")
-        #expect(audio.dim(1) == 2)
+        #expect(audio.ndim == 1, "model returns mono")
     }
 }

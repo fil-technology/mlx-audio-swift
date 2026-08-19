@@ -278,6 +278,22 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         return MLX.stacked(generatedFrames, axis: 1).asType(.int32)
     }
 
+    /// Collapses the codec's stereo output to mono.
+    ///
+    /// `SpeechGenerationModel` is a mono contract — `makePCMBuffer` builds a
+    /// 1-channel `AVAudioPCMBuffer` from a flat `[Float]`. MOSS is the first
+    /// 2-channel model here, and handing its interleaved frames straight to
+    /// that path plays L and R as consecutive mono samples: double length at
+    /// half speed. MOSS renders what is effectively dual-mono (measured
+    /// per-channel RMS agrees to five decimal places), so averaging is
+    /// lossless in practice and safe if the channels ever diverge.
+    static func monoDownmix(_ audio: MLXArray) -> MLXArray {
+        guard audio.ndim == 2, audio.dim(1) > 1 else {
+            return audio.ndim == 2 ? audio[0..., 0] : audio
+        }
+        return audio.mean(axis: -1)
+    }
+
     /// Deterministic greedy rollout of a single frame's 16 channels.
     ///
     /// Used only by the parity tests: exact token agreement with the Python
@@ -346,7 +362,8 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         guard let audioDecoder else {
             throw MossTTSNanoError.audioTokenizerUnavailable("no audio decoder attached")
         }
-        return try audioDecoder.decodeAudioCodes(codes, numQuantizers: config.nVQ)
+        let stereo = try audioDecoder.decodeAudioCodes(codes, numQuantizers: config.nVQ)
+        return Self.monoDownmix(stereo)
     }
 
     /// Generates codes for the whole text, chunk by chunk.
@@ -448,7 +465,8 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
                     let inputIDs = try self.buildInferenceInputIDs(text: chunk, promptCodes: promptCodes)
                     let codes = try self.generateAudioTokenIDs(promptInputIDs: inputIDs, options: options)
                     guard codes.dim(1) > 0 else { continue }
-                    let audio = try audioDecoder.decodeAudioCodes(codes, numQuantizers: self.config.nVQ)
+                    let stereo = try audioDecoder.decodeAudioCodes(codes, numQuantizers: self.config.nVQ)
+                    let audio = Self.monoDownmix(stereo)
                     audio.eval()
                     continuation.yield(.audio(audio))
                 }
