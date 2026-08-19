@@ -21,7 +21,7 @@ struct TTSModelRegistryEntry {
     }
 }
 
-enum TTSModelRegistry {
+public enum TTSModelRegistry {
     static let entries: [TTSModelRegistryEntry] = [
         .init(
             canonicalType: "qwen3_tts",
@@ -101,6 +101,46 @@ enum TTSModelRegistry {
             }
         )
     ]
+
+    /// Canonical loader type for a model, or `nil` when nothing here can load
+    /// it.
+    ///
+    /// Exposed so callers (notably TTSMLX's model store) can ask *this* table
+    /// whether a model is runnable, instead of keeping a parallel copy that
+    /// silently goes stale — a model missing from such a copy reports as
+    /// "unsupported by the current MLX runtime" even though the loader exists.
+    ///
+    /// - Parameters:
+    ///   - modelType: `model_type` from the model's `config.json`, if known.
+    ///   - architectures: `architectures` from `config.json`, if known.
+    ///   - repo: repository id, used only as a last-resort hint.
+    public static func canonicalModelType(
+        modelType: String? = nil,
+        architectures: [String] = [],
+        repo: String? = nil
+    ) -> String? {
+        if let normalized = normalizedModelType(modelType) {
+            return normalized
+        }
+        for architecture in architectures {
+            let lowered = architecture.lowercased()
+            if let match = entries.first(where: { entry in
+                entry.aliases.contains(where: { lowered.contains($0.replacingOccurrences(of: "_", with: "")) })
+                    || entry.repoMatchers.contains(where: { lowered.contains($0.replacingOccurrences(of: "_", with: "")) })
+            }) {
+                return match.canonicalType
+            }
+        }
+        if let repo {
+            return inferModelType(from: repo)
+        }
+        return nil
+    }
+
+    /// Every loader type this build can route to.
+    public static var supportedModelTypes: [String] {
+        entries.map(\.canonicalType)
+    }
 
     static func normalizedModelType(_ modelType: String?) -> String? {
         guard let modelType else { return nil }
