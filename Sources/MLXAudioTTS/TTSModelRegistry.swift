@@ -6,17 +6,24 @@ struct TTSModelRegistryEntry {
     let canonicalType: String
     let aliases: Set<String>
     let repoMatchers: [String]
+    /// Additional repositories this model needs before it can generate, beyond
+    /// its own weights. MOSS keeps its audio codec in a separate repo, so a
+    /// caller that downloads only the model repo still has to hit the network
+    /// on first generation — which defeats an onboarding prefetch.
+    let companionRepositories: [String]
     let loader: @Sendable (_ modelRepo: String, _ cache: HubCache) async throws -> any SpeechGenerationModel
 
     init(
         canonicalType: String,
         aliases: [String] = [],
         repoMatchers: [String] = [],
+        companionRepositories: [String] = [],
         loader: @escaping @Sendable (_ modelRepo: String, _ cache: HubCache) async throws -> any SpeechGenerationModel
     ) {
         self.canonicalType = canonicalType
         self.aliases = Set([canonicalType] + aliases)
         self.repoMatchers = repoMatchers
+        self.companionRepositories = companionRepositories
         self.loader = loader
     }
 }
@@ -82,6 +89,7 @@ public enum TTSModelRegistry {
             canonicalType: "moss_tts_nano",
             aliases: ["moss-tts-nano", "moss_tts", "moss"],
             repoMatchers: ["moss-tts-nano", "moss_tts_nano"],
+            companionRepositories: [mossDefaultAudioTokenizerRepo],
             loader: { modelRepo, cache in
                 let model = try await MossTTSNanoModel.fromPretrained(modelRepo, cache: cache)
                 // MOSS keeps its codec in a separate repo, so the decoder is
@@ -94,7 +102,7 @@ public enum TTSModelRegistry {
                 let configured = model.config.audioTokenizerRepo
                 let repo = (configured?.lowercased().contains("mlx") == true)
                     ? configured!
-                    : "mlx-community/MOSS-Audio-Tokenizer-Nano"
+                    : mossDefaultAudioTokenizerRepo
                 let decoder = try await MossAudioTokenizerModel.fromPretrained(repo, cache: cache)
                 model.attach(audioDecoder: decoder)
                 return model
@@ -135,6 +143,22 @@ public enum TTSModelRegistry {
             return inferModelType(from: repo)
         }
         return nil
+    }
+
+    /// Repositories that must be present, in addition to the model's own, for
+    /// a model of this type to generate without further network access.
+    ///
+    /// Intended for prefetch: an onboarding flow that downloads only the model
+    /// repo will still stall on first playback while a companion is fetched.
+    public static func companionRepositories(
+        modelType: String? = nil,
+        architectures: [String] = [],
+        repo: String? = nil
+    ) -> [String] {
+        guard let canonical = canonicalModelType(
+            modelType: modelType, architectures: architectures, repo: repo
+        ) else { return [] }
+        return entries.first(where: { $0.canonicalType == canonical })?.companionRepositories ?? []
     }
 
     /// Every loader type this build can route to.

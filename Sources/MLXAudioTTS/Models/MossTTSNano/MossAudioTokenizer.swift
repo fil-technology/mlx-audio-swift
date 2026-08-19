@@ -15,6 +15,14 @@ import MLXAudioCore
 /// audio* needs; named voices instead ship as pre-encoded codes (see
 /// ``MossVoicePack``), so the encoder is not on the device critical path.
 
+/// The MLX conversion of MOSS-Audio-Tokenizer-Nano.
+///
+/// The model's own `config.json` names the PyTorch build
+/// (`OpenMOSS-Team/...`), whose remote-code weights this loader cannot read,
+/// so that value is honoured only when it already points at an MLX
+/// conversion — see the registry entry.
+public let mossDefaultAudioTokenizerRepo = "mlx-community/MOSS-Audio-Tokenizer-Nano"
+
 // MARK: - Configuration
 
 public struct MossCodecStage: Decodable, Sendable {
@@ -620,7 +628,7 @@ public final class MossAudioTokenizerModel: Module, MossAudioDecoding, @unchecke
     }
 
     public static func fromPretrained(
-        _ modelRepo: String = "mlx-community/MOSS-Audio-Tokenizer-Nano",
+        _ modelRepo: String = mossDefaultAudioTokenizerRepo,
         cache: HubCache = .default
     ) async throws -> MossAudioTokenizerModel {
         let hfToken: String? = ProcessInfo.processInfo.environment["HF_TOKEN"]
