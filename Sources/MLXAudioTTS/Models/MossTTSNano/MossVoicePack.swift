@@ -10,7 +10,10 @@ import Foundation
 /// only tens of kilobytes.
 ///
 /// Codes were produced with `mlx-community/MOSS-Audio-Tokenizer-Nano` from the
-/// English reference clips in OpenMOSS/MOSS-TTS-Nano `assets/audio` (Apache-2.0).
+/// English reference clips in OpenMOSS/MOSS-TTS-Nano `assets/audio` (Apache-2.0),
+/// plus `en_news`: an 11 s excerpt of the English news sample published on the
+/// OpenMOSS MOSS-TTS-Nano demo page, which is the closest match to the
+/// newsreader delivery this framework is usually asked for.
 public final class MossVoicePack: @unchecked Sendable {
     private let codesByName: [String: MLXArray]
 

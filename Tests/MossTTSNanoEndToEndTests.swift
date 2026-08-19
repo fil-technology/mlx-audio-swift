@@ -143,6 +143,8 @@ struct MossTTSNanoEndToEndTests {
         let elapsed = Date().timeIntervalSince(started)
         let seconds = Double(totalFrames) / 48000.0
         let peakMB = Double(MLX.GPU.peakMemory) / 1_048_576.0
+        let cacheMB = Double(MLX.Memory.cacheMemory) / 1_048_576.0
+        print("[moss-stream] cache after stream \(cacheMB) MB")
         print("[moss-stream] \(chunks) chunks, \(seconds)s audio in \(elapsed)s "
               + "(RTF \(seconds / elapsed)x), first chunk at \(firstChunkAt ?? -1)s, peak \(peakMB) MB")
 
@@ -213,5 +215,45 @@ struct MossTTSNanoEndToEndTests {
         audio.eval()
         #expect(audio.dim(0) > 0, "nil voice produced no audio")
         #expect(audio.ndim == 1, "model returns mono")
+    }
+
+    /// Renders the same passage the demo app reads, for listening checks.
+    /// Writes to /tmp/moss_audition_<voice>.wav.
+    @Test func auditionBundledVoices() async throws {
+        guard await MossTTSNanoTokenizerTests.resolveModelDirectory() != nil else {
+            #expect(!MossTTSNanoTokenizerTests.requiresFixtures,
+                    "MOSS weights unavailable and MOSS_REQUIRE_FIXTURES=1")
+            return
+        }
+        let model = try await TTS.loadModel(modelRepo: "mlx-community/MOSS-TTS-Nano-100M")
+        guard let moss = model as? MossTTSNanoModel else { return }
+
+        let passage = """
+            The lighthouse keeper had not spoken to another soul in forty-three             days. Each morning he climbed the one hundred and twelve steps, wound             the great clockwork that turned the lamp, and watched the grey sea             refuse to change.
+            """
+        let words = passage.split(separator: " ").count
+
+        for voice in ["en_news", "en_3"] {
+            let started = Date()
+            let audio = try await moss.generate(
+                text: passage, voice: voice, refAudio: nil, refText: nil,
+                language: "English", generationParameters: moss.defaultGenerationParameters
+            )
+            audio.eval()
+            let seconds = Double(audio.dim(0)) / 48000.0
+            let wordsPerSecond = Double(words) / seconds
+            let elapsed = Date().timeIntervalSince(started)
+            print("[moss-audition] voice=\(voice) "
+                  + String(format: "%.2fs for %d words (%.2f words/s) in %.1fs",
+                           seconds, words, wordsPerSecond, elapsed))
+            // Natural read is roughly 2-3.5 words/s. Anything near 1.3 means the
+            // stereo-as-mono defect is back and audio is playing at half speed.
+            #expect(wordsPerSecond > 1.8,
+                    "\(voice) reads at \(wordsPerSecond) words/s — suspiciously slow")
+            #expect(wordsPerSecond < 5.0, "\(voice) reads at \(wordsPerSecond) words/s")
+
+            try Self.writeWAV(audio, sampleRate: 48000,
+                              to: URL(fileURLWithPath: "/tmp/moss_audition_\(voice).wav"))
+        }
     }
 }

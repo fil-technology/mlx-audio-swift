@@ -330,8 +330,10 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
     /// MOSS has no speaker embeddings, so *some* reference is always required.
     /// Rather than fail a caller that simply asked for speech, fall back to a
     /// stable bundled clip — callers that care pick from ``availableVoices``.
-    /// Kept fixed so output is reproducible across runs.
-    public static let defaultVoice = "en_3"
+    /// Kept fixed so output is reproducible across runs. `en_news` is a
+    /// newsreader read, which is the common case for this framework and
+    /// steadier than the conversational clips.
+    public static let defaultVoice = "en_news"
 
     /// Resolves prompt codes from a bundled voice name.
     func promptCodes(forVoice voice: String?) throws -> MLXArray {
@@ -468,6 +470,14 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
                     let stereo = try audioDecoder.decodeAudioCodes(codes, numQuantizers: self.config.nVQ)
                     let audio = Self.monoDownmix(stereo)
                     audio.eval()
+                    // The codec's deepest decoder stage allocates attention
+                    // buffers proportional to (frames * 32)^2. Once a chunk is
+                    // out those are dead but stay in MLX's buffer cache, and
+                    // with a 24 s look-ahead several chunks' worth accumulate —
+                    // enough to push an iPhone into jetsam territory. Returning
+                    // them between chunks costs a little re-allocation and a lot
+                    // less resident memory.
+                    MLX.Memory.clearCache()
                     continuation.yield(.audio(audio))
                 }
                 continuation.finish()
