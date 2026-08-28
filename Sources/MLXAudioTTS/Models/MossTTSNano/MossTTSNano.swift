@@ -41,6 +41,13 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
     /// chunk length.
     public var maxTextTokensPerChunk: Int = 75
 
+    /// Codebooks predicted per frame (1...16). `nil` uses all of them.
+    ///
+    /// The speed dial for bulk work. Lower values generate proportionally
+    /// faster and lose high-frequency detail; see
+    /// ``GenerationOptions/codebookCount``.
+    public var codebookCount: Int?
+
     private var tokenizer: SentencePieceBPETokenizer?
     private var audioDecoder: MossAudioDecoding?
     private var voicePack: MossVoicePack?
@@ -187,6 +194,15 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         public var audioTopK: Int = 25
         public var audioRepetitionPenalty: Float = 1.2
         public var maxTextTokensPerChunk: Int = 75
+
+        /// Codebooks to predict per frame, 1...n_vq (16).
+        ///
+        /// MOSS predicts each codebook sequentially through the local
+        /// transformer, so this is close to a linear dial on generation time:
+        /// the residual quantiser is ordered coarse-to-fine, and dropping the
+        /// finest levels costs high-frequency detail rather than intelligibility.
+        /// Worth trading for bulk work — a book — where wall-clock dominates.
+        public var codebookCount: Int?
         public init() {}
     }
 
@@ -201,7 +217,7 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         promptInputIDs: MLXArray,
         options: GenerationOptions
     ) throws -> MLXArray {
-        let effectiveNQ = config.nVQ
+        let effectiveNQ = min(max(1, options.codebookCount ?? config.nVQ), config.nVQ)
         let cache = transformer.makeCache()
         var currentInputIDs = promptInputIDs
         var generatedFrames: [MLXArray] = []
@@ -258,7 +274,18 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
                 currentLocalInput = audioEmbeddings[channel](channelToken)
             }
 
-            let frame = MLX.stacked(frameTokens, axis: -1)
+            var frame = MLX.stacked(frameTokens, axis: -1)
+            if effectiveNQ < config.nVQ {
+                // Frames stay full width so the decoder always sees n_vq
+                // channels; the unused ones carry the pad id, which the
+                // quantiser treats as "no contribution" rather than as a code.
+                let pad = MLXArray.full(
+                    [frame.dim(0), config.nVQ - effectiveNQ],
+                    values: MLXArray(Int32(config.audioPadTokenId)),
+                    type: Int32.self
+                )
+                frame = MLX.concatenated([frame, pad], axis: -1)
+            }
             generatedFrames.append(frame)
 
             let textColumn = MLXArray.full(
@@ -358,14 +385,76 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> MLXArray {
-        let codes = try await audioCodes(
-            text: text, voice: voice, refAudio: refAudio, parameters: generationParameters
-        )
         guard let audioDecoder else {
             throw MossTTSNanoError.audioTokenizerUnavailable("no audio decoder attached")
         }
-        let stereo = try audioDecoder.decodeAudioCodes(codes, numQuantizers: config.nVQ)
-        return Self.monoDownmix(stereo)
+
+        // Decode chunk by chunk and join the audio, rather than joining every
+        // chunk's codes and decoding once.
+        //
+        // The codec's deepest decoder stage attends over `frames * 32`
+        // positions, so its attention mask grows with the SQUARE of the total
+        // length. Decoding a whole passage in one pass measured 19.7 GB peak
+        // for two and a half minutes of speech — survivable on a Mac, instantly
+        // fatal on a phone, and worse the longer the text. Per chunk it stays
+        // in the hundreds of megabytes.
+        let chunks = try await audioCodeChunks(
+            text: text, voice: voice, refAudio: refAudio, parameters: generationParameters
+        )
+        var rendered: [MLXArray] = []
+        rendered.reserveCapacity(chunks.count)
+        for codes in chunks {
+            try Task.checkCancellation()
+            guard codes.dim(1) > 0 else { continue }
+            let stereo = try audioDecoder.decodeAudioCodes(codes, numQuantizers: config.nVQ)
+            let mono = Self.monoDownmix(stereo)
+            mono.eval()
+            rendered.append(mono)
+            // Hand back the decoder's working set before starting the next one.
+            MLX.Memory.clearCache()
+        }
+        guard !rendered.isEmpty else { return MLXArray.zeros([0], type: Float.self) }
+        return rendered.count == 1 ? rendered[0] : MLX.concatenated(rendered, axis: 0)
+    }
+
+    /// Codes for the whole text, one entry per chunk.
+    ///
+    /// Kept per chunk so callers can decode incrementally; concatenating first
+    /// makes the codec's attention mask grow quadratically with total length.
+    func audioCodeChunks(
+        text: String,
+        voice: String?,
+        refAudio: MLXArray?,
+        parameters: GenerateParameters
+    ) async throws -> [MLXArray] {
+        if refAudio != nil {
+            throw MossTTSNanoError.audioTokenizerUnavailable(
+                "reference-audio cloning needs the MOSS codec encoder, which is not ported yet; use a bundled voice"
+            )
+        }
+        guard let tokenizer else {
+            throw MossTTSNanoError.tokenizerUnavailable("tokenizer.model was not loaded")
+        }
+        let promptCodes = try promptCodes(forVoice: voice)
+
+        var options = GenerationOptions()
+        options.audioTemperature = Float(parameters.temperature)
+        options.audioTopP = Float(parameters.topP)
+        options.maxTextTokensPerChunk = maxTextTokensPerChunk
+        options.codebookCount = codebookCount
+
+        let normalized = MossTTSNanoText.lightweightNormalize(text)
+        let chunks = try MossTTSNanoText.splitIntoBestSentences(
+            tokenizer: tokenizer, text: normalized, maxTokens: options.maxTextTokensPerChunk
+        )
+
+        var all: [MLXArray] = []
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let inputIDs = try buildInferenceInputIDs(text: chunk, promptCodes: promptCodes)
+            all.append(try generateAudioTokenIDs(promptInputIDs: inputIDs, options: options))
+        }
+        return all
     }
 
     /// Generates codes for the whole text, chunk by chunk.
@@ -389,6 +478,7 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         options.audioTemperature = Float(parameters.temperature)
         options.audioTopP = Float(parameters.topP)
         options.maxTextTokensPerChunk = maxTextTokensPerChunk
+        options.codebookCount = codebookCount
 
         let normalized = MossTTSNanoText.lightweightNormalize(text)
         let chunks = try MossTTSNanoText.splitIntoBestSentences(
@@ -456,6 +546,7 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
                 options.audioTemperature = Float(generationParameters.temperature)
                 options.audioTopP = Float(generationParameters.topP)
                 options.maxTextTokensPerChunk = self.maxTextTokensPerChunk
+                options.codebookCount = self.codebookCount
 
                 let normalized = MossTTSNanoText.lightweightNormalize(text)
                 let chunks = try MossTTSNanoText.splitIntoBestSentences(
