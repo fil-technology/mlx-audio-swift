@@ -63,7 +63,7 @@ let package = Package(
         // that need the background-safe fork redirect it with a SwiftPM
         // mirror, which rewrites every declaration at once. See
         // Tools/verify-mlx-fork.sh in TTSMLX for the check that it took.
-        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", "0.31.6"..<"0.33.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", "2.30.3"..<"4.0.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
