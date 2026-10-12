@@ -45,10 +45,18 @@ public final class MarvisTTSModel: Module {
         self.sampleRate = Int(audioTokenizer.codec.cfg.sampleRate)
         super.init()
 
-        // Best-effort cache pre-warm; resetCaches() is a throwing call on mlx-swift-lm 3.32.3
-        // (makePromptCache now throws). It is invoked again (with `try`) at the start of generation,
-        // so swallowing a pre-warm failure here is safe and keeps this init non-throwing.
-        try? model.resetCaches()
+        // Best-effort cache pre-warm. resetCaches() throws on mlx-swift-lm 3.32.3 (makePromptCache now
+        // throws). A failure here cannot leave invalid model state: it leaves caches unset and
+        // cachesEnabled == false (a valid un-warmed model), and generation calls resetCaches() again with
+        // `try` at the start of every prompt — before generateFrame's precondition(cachesEnabled) — so no
+        // invalid state reaches inference. Logged (not silently swallowed) and kept non-throwing so the
+        // initializer's contract is unchanged.
+        do {
+            try model.resetCaches()
+        } catch {
+            FileHandle.standardError.write(Data(
+                "[Marvis] cache pre-warm skipped (\(error)); caches warm at generation start.\n".utf8))
+        }
     }
 
     public convenience init(
