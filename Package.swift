@@ -63,8 +63,8 @@ let package = Package(
         // that need the background-safe fork redirect it with a SwiftPM
         // mirror, which rewrites every declaration at once. See
         // Tools/verify-mlx-fork.sh in TTSMLX for the check that it took.
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "2.30.3")),
+        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", "2.30.3"..<"4.0.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
     ],
@@ -92,6 +92,13 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
+                // Sources import `Tokenizers`; declare it explicitly. This was
+                // previously satisfied by a leaky transitive import via
+                // mlx-swift-lm 2.x's MLXLMCommon (which depended on
+                // swift-transformers). mlx-swift-lm 3.x drops that dependency,
+                // so the Tokenizers→Hub→yyjson clang module no longer propagates
+                // into this target's compile and the yyjson module scan fails.
+                .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Sources/MLXAudioCodecs"
         ),
