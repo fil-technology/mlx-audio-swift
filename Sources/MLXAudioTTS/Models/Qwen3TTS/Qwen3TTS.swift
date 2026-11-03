@@ -225,7 +225,15 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             ttsPadEmbed = prepared.2
             refCodes = prepared.3
         } else {
-            let prepared = prepareGenerationInputs(text: text, language: language, instruct: instruct)
+            // CustomVoice models take `voice` as "speaker" or "speaker, instruction";
+            // the speaker selects one of the built-in timbres (config `spk_id`).
+            let isCustomVoice = config.ttsModelType == "custom_voice"
+            let customVoicePrompt = isCustomVoice ? Self.parseCustomVoicePrompt(instruct) : nil
+            let speaker: String? = isCustomVoice ? customVoicePrompt?.speaker : nil
+            let effectiveInstruct: String? = isCustomVoice ? customVoicePrompt?.instruction : instruct
+            let prepared = prepareGenerationInputs(
+                text: text, language: language, instruct: effectiveInstruct, speaker: speaker
+            )
             inputEmbedsInit = prepared.0
             trailingTextHidden = prepared.1
             ttsPadEmbed = prepared.2
@@ -596,10 +604,26 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return embedding
     }
 
+    /// Splits a CustomVoice `voice` value into its speaker name and optional
+    /// style instruction: "ryan" or "ryan, speak slowly and warmly".
+    static func parseCustomVoicePrompt(_ voice: String?) -> (speaker: String, instruction: String?)? {
+        guard let voice = voice?.trimmingCharacters(in: .whitespacesAndNewlines), !voice.isEmpty else {
+            return nil
+        }
+        guard let commaIndex = voice.firstIndex(of: ",") else {
+            return (speaker: voice, instruction: nil)
+        }
+        let speaker = voice[..<commaIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+        let instruction = voice[voice.index(after: commaIndex)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !speaker.isEmpty else { return (speaker: voice, instruction: nil) }
+        return (speaker: String(speaker), instruction: instruction.isEmpty ? nil : String(instruction))
+    }
+
     func prepareGenerationInputs(
         text: String,
         language: String,
-        instruct: String?
+        instruct: String?,
+        speaker: String? = nil
     ) -> (MLXArray, MLXArray, MLXArray) {
         guard let tokenizer, let talkerConfig = config.talkerConfig else {
             fatalError("Tokenizer/config not loaded")
@@ -621,10 +645,29 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let ttsEosEmbed = ttsEmbeds[0..., 1 ..< 2, 0...]
         let ttsPadEmbed = ttsEmbeds[0..., 2 ..< 3, 0...]
 
-        // Language ID
+        // Language ID — a dialect speaker overrides it below.
         var languageId: Int?
         if language.lowercased() != "auto", let langMap = talkerConfig.codecLanguageId {
             languageId = langMap[language.lowercased()]
+        }
+
+        // CustomVoice speaker: the speaker's codec token embedding is spliced
+        // into the codec prefix (between the think block and pad/bos).
+        var speakerEmbed: MLXArray?
+        if let speaker {
+            let key = speaker.lowercased()
+            if let spkIdValue = talkerConfig.spkId?[key] {
+                let spkIdArray = MLXArray([Int32(spkIdValue.intValue)]).reshaped(1, 1)
+                speakerEmbed = talker.getInputEmbeddings()(spkIdArray)
+            } else {
+                print("[Qwen3TTS] CustomVoice: speaker '\(speaker)' not in spk_id; using the default timbre")
+            }
+            if let dialectVal = talkerConfig.spkIsDialect?[key],
+               dialectVal.isDialect,
+               let dialectName = dialectVal.dialectName,
+               let dialectLangId = talkerConfig.codecLanguageId?[dialectName] {
+                languageId = dialectLangId
+            }
         }
 
         // Build codec prefix
@@ -647,7 +690,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let codecEmbedSuffix = talker.getInputEmbeddings()(
             MLXArray([Int32(talkerConfig.codecPadId), Int32(talkerConfig.codecBosId)]).reshaped(1, 2)
         )
-        codecEmbed = concatenated([codecEmbed, codecEmbedSuffix], axis: 1)
+        if let speakerEmbed {
+            codecEmbed = concatenated(
+                [codecEmbed, speakerEmbed.reshaped([1, 1, -1]).asType(codecEmbed.dtype), codecEmbedSuffix],
+                axis: 1
+            )
+        } else {
+            codecEmbed = concatenated([codecEmbed, codecEmbedSuffix], axis: 1)
+        }
 
         // Instruct embedding
         var instructEmbed: MLXArray?
