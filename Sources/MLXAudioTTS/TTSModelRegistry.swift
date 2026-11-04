@@ -91,11 +91,17 @@ public enum TTSModelRegistry {
         }
         for architecture in architectures {
             let lowered = architecture.lowercased()
-            if let match = entries.first(where: { entry in
-                entry.aliases.contains { lowered.contains($0.replacingOccurrences(of: "_", with: "")) }
-            }) {
-                return match.canonicalType
+            // Longest alias wins: "MossTTSNanoForCausalLM" contains both
+            // "mosstts" and "mosstssnano", and must map to moss_tts_nano.
+            var best: (type: String, length: Int)?
+            for entry in entries {
+                for alias in entry.aliases {
+                    let needle = alias.replacingOccurrences(of: "_", with: "")
+                    guard lowered.contains(needle), needle.count > (best?.length ?? 0) else { continue }
+                    best = (entry.canonicalType, needle.count)
+                }
             }
+            if let best { return best.type }
         }
         if let repo, let inferred = TTS.inferModelType(from: repo) {
             return normalizedModelType(inferred) ?? inferred
