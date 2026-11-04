@@ -566,8 +566,10 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
     // MARK: - Reference Audio Processing
 
     /// Process reference audio to extract speaker embedding and prompt tokens.
-    /// Conditioning result from reference audio processing.
-    struct RefAudioConditioning {
+    /// Conditioning result from reference audio processing. Opaque outside the
+    /// module: hosts obtain one from `prepareReferenceConditioning` and hand it
+    /// back through `preparedConditioning` to reuse a voice across calls.
+    public struct RefAudioConditioning: @unchecked Sendable {
         let t3Cond: T3Cond
         /// S3Gen x-vector (speaker embedding for flow decoder)
         let xVector: MLXArray
@@ -576,6 +578,17 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         /// S3Gen prompt mel features (mel spectrogram for flow conditioning)
         let s3genPromptFeat: MLXArray
     }
+
+    /// Conditioning computed once from a reference clip (24 kHz mono), so
+    /// several generations can share the same speaker without re-running the
+    /// tokenizer and speaker encoders. Set it as `preparedConditioning`.
+    public func prepareReferenceConditioning(_ refAudio: MaterializedArray) throws -> RefAudioConditioning {
+        try prepareConditionals(refAudio: refAudio)
+    }
+
+    /// Used when `generate` receives no `refAudio`; takes precedence over the
+    /// bundled default voice. Reset it to `nil` to go back to the default.
+    public var preparedConditioning: RefAudioConditioning?
 
     func prepareConditionals(
         refAudio: MLXArray,
@@ -783,6 +796,18 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             xVector = refCond.xVector
             promptTokens = refCond.s3genPromptToken
             promptFeat = refCond.s3genPromptFeat
+        } else if let prepared = preparedConditioning {
+            // A voice prepared once by the host; the exaggeration override is
+            // applied now rather than at preparation time.
+            t3Cond = T3Cond(
+                speakerEmb: prepared.t3Cond.speakerEmb,
+                condPromptSpeechTokens: prepared.t3Cond.condPromptSpeechTokens,
+                condPromptSpeechEmb: nil,
+                emotionAdv: MLXArray(Float(emotionAdvOverride ?? 0.5))
+            )
+            xVector = prepared.xVector
+            promptTokens = prepared.s3genPromptToken
+            promptFeat = prepared.s3genPromptFeat
         } else if let defaults = defaultConditioning {
             // Use pre-computed default voice
             t3Cond = T3Cond(

@@ -60,7 +60,10 @@ let package = Package(
 
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.33.0")),
+        // The background-safe fork (upstream 0.33.0 plus the Metal patch). Naming
+        // it here, not only in TTSMLX, leaves nothing in a consumer's graph that
+        // names ml-explore/mlx-swift, so no SwiftPM mirror is needed.
+        .package(url: "https://github.com/fil-technology/mlx-swift.git", exact: "0.33.100"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1")),
         .package(url: "https://github.com/facebook/zstd.git", from: "1.5.7")
