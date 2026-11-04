@@ -17,6 +17,49 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
     private var hfToken: String?
     private var cache: HubCache = .default
 
+    // MARK: Fork additions (fil-technology/mlx-audio-swift)
+
+    /// Text-token budget per generated chunk. The reference uses 75.
+    public var maxTextTokensPerChunk: Int = 75
+
+    /// Codebooks predicted per frame (1...n_vq). `nil` uses all of them.
+    ///
+    /// MOSS predicts each codebook sequentially through the local transformer,
+    /// so this is close to a linear dial on generation time: the residual
+    /// quantiser is ordered coarse-to-fine, and dropping the finest levels costs
+    /// high-frequency detail rather than intelligibility. Measured 2.4x faster
+    /// per word at 8 of 16.
+    public var codebookCount: Int?
+
+    private var voicePack: MossVoicePack?
+
+    /// Voice used when a caller passes neither `voice` nor `refAudio`.
+    ///
+    /// MOSS has no speaker embeddings, so *some* reference is always required.
+    /// `en_news` is a newsreader read, steadier than the conversational clips.
+    public static let defaultVoice = "en_news"
+
+    /// Names accepted as `voice` without reference audio.
+    public var availableVoices: [String] { voicePack?.names ?? [] }
+
+    /// Prompt codes for a bundled voice name.
+    func promptCodes(forVoice voice: String?) throws -> MLXArray {
+        guard let voicePack else {
+            throw MossTTSNanoError.unknownVoice("bundled voice pack failed to load")
+        }
+        let requested = (voice?.isEmpty == false) ? voice! : Self.defaultVoice
+        return try voicePack.codes(for: requested)
+    }
+
+    /// The codec decodes to `[frames, channels]`; `SpeechGenerationModel`
+    /// callers expect a flat mono waveform.
+    static func monoDownmix(_ audio: MLXArray) -> MLXArray {
+        guard audio.ndim == 2, audio.dim(1) > 1 else {
+            return audio.ndim == 2 ? audio[0..., 0] : audio
+        }
+        return audio.mean(axis: -1)
+    }
+
     public var sampleRate: Int { config.audioTokenizerSampleRate }
 
     public var defaultGenerationParameters: GenerateParameters {
@@ -460,54 +503,14 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> MaterializedArray {
-        _ = voice
         _ = refText
         _ = language
-        guard let tokenizer else {
-            throw MossTTSNanoError.tokenizerNotInitialized
-        }
-        guard let refAudio else {
-            throw MossTTSNanoError.invalidInput("MOSS-TTS-Nano requires refAudio for voice_clone generation.")
-        }
-
-        try await ensureAudioTokenizer()
-        let promptAudioCodes = try encodeReferenceAudio(
-            refAudio,
-            numQuantizers: config.nVQ
-        )
-        let mode = "voice_clone"
-        let normalizedText = mossLightweightNormalizeText(text)
-        let chunks = try mossSplitTextIntoBestSentences(
-            tokenizer: tokenizer,
-            text: normalizedText,
-            maxTokens: 75
-        )
-        var allAudioTokens: [MLXArray] = []
-        for chunk in chunks {
-            let prepared = try buildInferenceInputIDs(
-                text: chunk,
-                tokenizer: tokenizer,
-                mode: mode,
-                promptText: nil,
-                promptAudioCodes: promptAudioCodes
-            )
-            let audioTokens = try generateAudioTokenIDs(
-                promptInputIDs: prepared.inputIDs,
-                attentionMask: prepared.attentionMask,
-                maxNewFrames: generationParameters.maxTokens ?? 375,
-                doSample: generationParameters.temperature > 0,
-                audioTemperature: generationParameters.temperature,
-                audioTopP: generationParameters.topP,
-                audioTopK: generationParameters.topK,
-                audioRepetitionPenalty: generationParameters.repetitionPenalty ?? 1.1
-            )
-            allAudioTokens.append(audioTokens)
-        }
-
-        let audioTokenIDs = allAudioTokens.isEmpty
-            ? MLXArray.zeros([1, 0, config.nVQ], type: Int32.self)
-            : MLX.concatenated(allAudioTokens, axis: 1).asType(.int32)
-        return (try decodeAudioTokenIDs(audioTokenIDs, numQuantizers: config.nVQ)).materialized()
+        var rendered: [MLXArray] = []
+        try await forEachRenderedChunk(
+            text: text, voice: voice, refAudio: refAudio, generationParameters: generationParameters
+        ) { rendered.append($0) }
+        guard !rendered.isEmpty else { return MLXArray.zeros([0], type: Float.self).materialized() }
+        return (rendered.count == 1 ? rendered[0] : MLX.concatenated(rendered, axis: 0)).materialized()
     }
 
     public func generateStream(
@@ -518,24 +521,88 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         language: String?,
         generationParameters: GenerateParameters
     ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        _ = refText
+        _ = language
         return AsyncThrowingStream { continuation in
             let task = Task { @Sendable in
                 do {
-                    let audio = try await self.generate(
-                        text: text,
-                        voice: voice,
-                        refAudio: refAudio,
-                        refText: refText,
-                        language: language,
+                    try await self.forEachRenderedChunk(
+                        text: text, voice: voice, refAudio: refAudio,
                         generationParameters: generationParameters
-                    )
-                    continuation.yield(.audio(audio))
+                    ) { continuation.yield(.audio($0.materialized())) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+    }
+
+    /// Fork change: generates and decodes sentence by sentence, handing each
+    /// mono chunk to `body`, instead of concatenating every chunk's codes and
+    /// decoding once.
+    ///
+    /// The codec's deepest decoder stage attends over `frames * 32` positions,
+    /// so a single decode grows with the SQUARE of the total length: two and a
+    /// half minutes of speech peaked at 19.7 GB in one pass and 1.7 GB per
+    /// chunk. Streaming callers also get their first audio after one sentence
+    /// rather than after the whole text.
+    ///
+    /// The reference comes from `refAudio` when given (encoded with the codec,
+    /// as upstream does) and otherwise from the bundled voice pack by name, so
+    /// a caller that only asks for speech still gets a stable voice.
+    private func forEachRenderedChunk(
+        text: String,
+        voice: String?,
+        refAudio: MaterializedArray?,
+        generationParameters: GenerateParameters,
+        _ body: (MLXArray) -> Void
+    ) async throws {
+        guard let tokenizer else {
+            throw MossTTSNanoError.tokenizerNotInitialized
+        }
+        try await ensureAudioTokenizer()
+        let promptAudioCodes: MLXArray
+        if let refAudio {
+            promptAudioCodes = try encodeReferenceAudio(refAudio, numQuantizers: config.nVQ)
+        } else {
+            promptAudioCodes = try promptCodes(forVoice: voice)
+        }
+
+        let normalizedText = mossLightweightNormalizeText(text)
+        let chunks = try mossSplitTextIntoBestSentences(
+            tokenizer: tokenizer,
+            text: normalizedText,
+            maxTokens: maxTextTokensPerChunk
+        )
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let prepared = try buildInferenceInputIDs(
+                text: chunk,
+                tokenizer: tokenizer,
+                mode: "voice_clone",
+                promptText: nil,
+                promptAudioCodes: promptAudioCodes
+            )
+            let audioTokens = try generateAudioTokenIDs(
+                promptInputIDs: prepared.inputIDs,
+                attentionMask: prepared.attentionMask,
+                nq: codebookCount,
+                maxNewFrames: generationParameters.maxTokens ?? 375,
+                doSample: generationParameters.temperature > 0,
+                audioTemperature: generationParameters.temperature,
+                audioTopP: generationParameters.topP,
+                audioTopK: generationParameters.topK,
+                audioRepetitionPenalty: generationParameters.repetitionPenalty ?? 1.1
+            )
+            guard audioTokens.dim(1) > 0 else { continue }
+            let stereo = try decodeAudioTokenIDs(audioTokens.asType(.int32), numQuantizers: config.nVQ)
+            let mono = Self.monoDownmix(stereo)
+            mono.eval()
+            body(mono)
+            // Hand back the decoder's working set before the next chunk.
+            MLX.Memory.clearCache()
         }
     }
 
@@ -582,6 +649,7 @@ public final class MossTTSNanoModel: Module, SpeechGenerationModel, @unchecked S
         if FileManager.default.fileExists(atPath: audioTokenizerURL.appendingPathComponent("config.json").path) {
             model.audioTokenizer = try MLXMossAudioTokenizer.fromModelDirectory(audioTokenizerURL)
         }
+        model.voicePack = try? MossVoicePack.bundled()
         return model
     }
 }

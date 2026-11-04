@@ -471,7 +471,7 @@ public enum TTS {
         return architectures.contains("TadaForCausalLM") ? "tada" : nil
     }
 
-    private static func inferModelType(from modelRepo: String) -> String? {
+    static func inferModelType(from modelRepo: String) -> String? {
         let lower = modelRepo.lowercased()
         if lower.contains("zonos2") { return "zonos2" }
         if lower.contains("ming-3.0-tts-tiny") { return "lingv3_tts" }

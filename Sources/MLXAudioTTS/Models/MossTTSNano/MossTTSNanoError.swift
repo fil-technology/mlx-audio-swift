@@ -5,6 +5,8 @@ public enum MossTTSNanoError: Error, CustomStringConvertible {
     case notImplemented(String)
     case tokenizerNotInitialized
     case audioTokenizerNotInitialized
+    /// Fork addition: `voice` named no clip in the bundled ``MossVoicePack``.
+    case unknownVoice(String)
 
     public var description: String {
         switch self {
@@ -16,6 +18,8 @@ public enum MossTTSNanoError: Error, CustomStringConvertible {
             "MOSS-TTS-Nano tokenizer is not initialized."
         case .audioTokenizerNotInitialized:
             "MOSS-TTS-Nano audio tokenizer is not initialized."
+        case .unknownVoice(let name):
+            "MOSS-TTS-Nano has no bundled voice named '\(name)'."
         }
     }
 }

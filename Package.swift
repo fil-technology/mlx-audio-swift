@@ -146,7 +146,11 @@ let package = Package(
                 "Models/StyleTTS2/KittenTTS/README.md",
                 "Models/StyleTTS2/Kokoro/README.md",
             ],
-            resources: [.copy("Models/OuteTTS/outetts_default_speaker.json")]
+            resources: [
+                .copy("Models/OuteTTS/outetts_default_speaker.json"),
+                // Fork addition: pre-encoded MOSS-TTS-Nano reference clips; see MossVoicePack.
+                .copy("Resources/MossVoices"),
+            ]
         ),
 
         // MARK: - MLXAudioSTT
