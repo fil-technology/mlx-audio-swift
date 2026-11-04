@@ -315,7 +315,9 @@ public enum TTS {
                 pretrained: { try await OuteTTSModel.fromPretrained($0, cache: $1) },
                 local: { modelDir, _ in try await OuteTTSModel.fromModelDirectory(modelDir, cache: source.cache) }
             )
-        case "pocket_tts", "phonon":
+        // Fork addition: gradium/phonon-* checkpoints declare model_type
+        // "gradium_phonon_tts"; upstream only matched the repo name.
+        case "pocket_tts", "phonon", "gradium_phonon_tts":
             return try await load(
                 source,
                 modelType: resolvedType,

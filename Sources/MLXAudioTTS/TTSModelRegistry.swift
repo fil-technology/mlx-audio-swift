@@ -59,7 +59,7 @@ public enum TTSModelRegistry {
         .init("moss_tts_nano", companions: ["mlx-community/MOSS-Audio-Tokenizer-Nano"]),
         .init("omnivoice"),
         .init("outetts", aliases: ["oute_tts"], companions: ["mlx-community/dac-speech-24khz-1.5kbps"]),
-        .init("pocket_tts", aliases: ["phonon"]),
+        .init("pocket_tts", aliases: ["phonon", "gradium_phonon_tts"]),
         .init("qwen3", aliases: ["qwen"], companions: ["mlx-community/snac_24khz"]),
         .init("qwen3_tts"),
         .init("rumik_oss", aliases: ["rumik"]),
