@@ -351,6 +351,8 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         case modelType = "model_type"
         case t3Config = "t3_config"
         case t3 = "t3"
+        case multilingual = "multilingual"
+        case textVocabSize = "vocab_size"
         case gpt2 = "gpt2"
         case s3Sr = "s3_sr"
         case s3genSr = "s3gen_sr"
@@ -426,6 +428,13 @@ public struct ChatterboxConfiguration: Codable, Sendable {
             self.t3Config = t3
         } else if modelType == "chatterbox_turbo" {
             self.t3Config = .turbo
+        } else if try container.decodeIfPresent(Bool.self, forKey: .multilingual) == true
+            || container.decodeIfPresent(Int.self, forKey: .textVocabSize) == T3Configuration.multilingual.textTokensDictSize
+        {
+            // mlx-community/chatterbox-{fp16,8bit,4bit} ship the multilingual
+            // weights with only `"multilingual": true` / `"vocab_size": 2454`
+            // at the top level and no t3 block.
+            self.t3Config = .multilingual
         } else {
             self.t3Config = .englishOnly
         }

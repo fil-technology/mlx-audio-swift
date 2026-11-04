@@ -478,24 +478,89 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
     // MARK: - Text Tokenization
 
     /// Tokenize text into token IDs for T3.
-    func tokenizeText(_ text: String) throws -> MLXArray {
+    func tokenizeText(_ text: String, language: String? = nil) throws -> MLXArray {
         guard let tokenizer = tokenizer else {
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
         }
 
-        let encoded = tokenizer.encode(text: text)
-
         if config.meanflow {
             // Turbo: GPT-2 tokenizer — use raw token IDs, no SOT/EOT wrapping
+            let encoded = tokenizer.encode(text: text)
             let ids = encoded.map { Int32($0) }
             return MLXArray(ids).reshaped([1, -1])
-        } else {
-            // Regular (LLaMA): custom EnTokenizer — wrap with SOT/EOT
-            var ids = [Int32(sotToken)]
-            ids.append(contentsOf: encoded.map { Int32($0) })
-            ids.append(Int32(eotToken))
-            return MLXArray(ids)
         }
+
+        // Regular (LLaMA): mirror the reference `EnTokenizer` / `MTLTokenizer`
+        // pipeline (resemble-ai/chatterbox): `punc_norm`, then for the
+        // multilingual vocabulary lowercase + NFKD + a leading `[lang]` tag,
+        // then spaces become the `[SPACE]` token. Without this the
+        // `Whitespace` pre-tokenizer drops every space and the model never
+        // sees word boundaries. Language-specific rewrites (Chinese Cangjie,
+        // Japanese kana, Hebrew diacritics, Korean, Russian stress) are not
+        // ported; those languages run through the tokenizer as written.
+        var normalized = Self.normalizePunctuation(text)
+        if config.t3Config.isMultilingual {
+            normalized = normalized.lowercased().decomposedStringWithCompatibilityMapping
+            if let tag = Self.languageTag(for: language),
+               let id = tokenizer.convertTokenToId(tag), id != tokenizer.unknownTokenId {
+                normalized = tag + normalized
+            }
+        }
+        if let spaceID = tokenizer.convertTokenToId("[SPACE]"), spaceID != tokenizer.unknownTokenId {
+            normalized = normalized.replacingOccurrences(of: " ", with: "[SPACE]")
+        }
+        let encoded = tokenizer.encode(text: normalized)
+        var ids = [Int32(sotToken)]
+        ids.append(contentsOf: encoded.map { Int32($0) })
+        ids.append(Int32(eotToken))
+        return MLXArray(ids)
+    }
+
+    /// Port of the reference `punc_norm`: capitalise the first letter, collapse
+    /// whitespace, replace punctuation rare in the training data, and make
+    /// sure the text ends with a sentence ender.
+    static func normalizePunctuation(_ raw: String) -> String {
+        guard !raw.isEmpty else { return "You need to add some text for me to talk." }
+        var text = raw
+        if let first = text.first, first.isLowercase {
+            text = first.uppercased() + text.dropFirst()
+        }
+        text = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let replacements: [(String, String)] = [
+            ("...", ", "), ("\u{2026}", ", "), (":", ","), (" - ", ", "), (";", ", "),
+            ("\u{2014}", "-"), ("\u{2013}", "-"), (" ,", ","),
+            ("\u{201C}", "\""), ("\u{201D}", "\""), ("\u{2018}", "'"), ("\u{2019}", "'"),
+        ]
+        for (old, new) in replacements {
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        while text.hasSuffix(" ") { text.removeLast() }
+        let enders: Set<Character> = [".", "!", "?", "-", ",", "\u{3001}", "\u{FF0C}", "\u{3002}", "\u{FF1F}", "\u{FF01}"]
+        if let last = text.last, !enders.contains(last) {
+            text += "."
+        }
+        return text
+    }
+
+    /// `[xx]` language tag for the multilingual tokenizer. Accepts an ISO 639-1
+    /// code (`"fr"`, `"fr-FR"`, `"fr_CA"`) or an English language name as
+    /// TTSMLX passes it (`"French"`). Returns nil when the language is unknown,
+    /// so the caller can fall back to untagged text.
+    static func languageTag(for language: String?) -> String? {
+        guard let language = language?.trimmingCharacters(in: .whitespaces).lowercased(), !language.isEmpty else {
+            return nil
+        }
+        let names: [String: String] = [
+            "arabic": "ar", "danish": "da", "german": "de", "greek": "el", "english": "en",
+            "spanish": "es", "finnish": "fi", "french": "fr", "hebrew": "he", "hindi": "hi",
+            "italian": "it", "japanese": "ja", "korean": "ko", "malay": "ms", "dutch": "nl",
+            "norwegian": "no", "polish": "pl", "portuguese": "pt", "russian": "ru",
+            "swedish": "sv", "swahili": "sw", "turkish": "tr", "chinese": "zh",
+        ]
+        if let code = names[language] { return "[\(code)]" }
+        let code = language.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map(String.init) ?? language
+        guard code.count == 2, code.allSatisfy(\.isLetter) else { return nil }
+        return "[\(code)]"
     }
 
     // MARK: - Reference Audio Processing
@@ -737,7 +802,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         }
 
         // Tokenize text
-        let textTokens = try tokenizeText(text)
+        let textTokens = try tokenizeText(text, language: language)
         print("[Chatterbox] Text tokenized: \(textTokens.shape)")
 
         let temperature = generationParameters.temperature
