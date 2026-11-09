@@ -330,8 +330,9 @@ extension VoxCPM2Model {
                     if recent.count > window { recent.removeFirst(recent.count - window) }
                     let audio = self.decodePatches(recent)
                     let total = audio.dim(0)
-                    let chunk = audio[max(0, total - perPatch)...]
-                    eval(chunk)
+                    // A slice is a view into the decoded buffer, which MLX recycles once
+                    // the window moves on; hand the consumer its own copy of the samples.
+                    let chunk = MLXArray(audio[max(0, total - perPatch)...].asArray(Float.self))
                     if firstAudio == nil { firstAudio = Date().timeIntervalSince(startTime) }
                     emitted += chunk.dim(0)
                     continuation.yield(.audio(chunk.materialized()))
