@@ -270,6 +270,32 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
 
     // MARK: - Generation
 
+    /// Maps the shared protocol inputs onto VoxCPM2's prompt modes: a clip
+    /// alone is an isolated timbre reference, a clip with its transcript is a
+    /// continuation prompt. `voice` has no meaning here (a voice description
+    /// goes in parentheses at the front of the text). Per-call CFG, steps and
+    /// seed come through `generate(text:prompt:parameters:)`.
+    func prompt(refAudio: MaterializedArray?, refText: String?) -> VoxCPM2Prompt {
+        guard let refAudio else { return VoxCPM2Prompt() }
+        if let refText, !refText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return VoxCPM2Prompt(promptAudio: refAudio, promptText: refText)
+        }
+        return VoxCPM2Prompt(referenceAudio: refAudio)
+    }
+
+    /// Per-call knobs a host sets before calling the protocol's `generate` /
+    /// `generateStream` (which only carry `maxTokens` and `seed`): diffusion
+    /// steps, CFG scale and the streaming window. `nil` fields keep the
+    /// checkpoint's values. Reset it between unrelated requests.
+    public var callParameters = VoxCPM2GenerationParameters()
+
+    func parameters(from generationParameters: GenerateParameters) -> VoxCPM2GenerationParameters {
+        var parameters = callParameters
+        if let maxTokens = generationParameters.maxTokens { parameters.maxTokens = maxTokens }
+        if let seed = generationParameters.seed { parameters.seed = seed }
+        return parameters
+    }
+
     public func generate(
         text: String,
         voice: String?,
@@ -278,157 +304,11 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> MaterializedArray {
-        let maxTokens = generationParameters.maxTokens ?? config.maxLength
-        let minTokens = 2
-        let inferenceTimesteps = config.inferenceTimesteps
-        let cfgValue = config.cfgScale
-
-        let scaleEmb = Float(config.lmConfig.useMup ? config.lmConfig.scaleEmb : 1)
-        let latentDim = audioVAE.latentDim
-
-        // Tokenize text
-        let textIds = try tokenize(text)
-
-        // Determine mode: reference cloning vs zero-shot
-        let textToken: MLXArray
-        let audioFeat: MLXArray
-        let textMask: MLXArray
-        let audioMask: MLXArray
-
-        if let refAudio {
-            // Reference cloning mode
-            let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
-            let textLength = tokenArray.dim(0)
-
-            let refFeat = try encodeWav(refAudio)
-            let (refTokens, refFeats, refTMask, refAMask) = makeRefPrefix(refFeat)
-
-            let textPadFeat = MLXArray.zeros([textLength, patchSize, latentDim])
-
-            textToken = MLX.concatenated([refTokens, tokenArray])
-            audioFeat = MLX.concatenated([refFeats, textPadFeat], axis: 0)
-            textMask = MLX.concatenated([
-                refTMask,
-                MLXArray.ones([textLength]),
-            ])
-            audioMask = MLX.concatenated([
-                refAMask,
-                MLXArray.zeros([textLength]),
-            ])
-        } else {
-            // Zero-shot mode
-            let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
-            let textLength = tokenArray.dim(0)
-
-            textToken = tokenArray
-            audioFeat = MLXArray.zeros([textLength, patchSize, latentDim])
-            textMask = MLXArray.ones([textLength])
-            audioMask = MLXArray.zeros([textLength])
-        }
-
-        // Add batch dimension
-        let bTextToken = textToken.expandedDimensions(axis: 0)
-        let bAudioFeat = audioFeat.expandedDimensions(axis: 0)
-        let bTextMask = textMask.expandedDimensions(axis: 0)
-        let bAudioMask = audioMask.expandedDimensions(axis: 0)
-
-        // Encode audio features
-        var featEmbed = featEncoder(bAudioFeat)
-        featEmbed = encToLmProj(featEmbed)
-
-        // Text embedding with scale
-        let textEmbed = baseLM.embedTokens!(bTextToken) * scaleEmb
-
-        // Combine text and audio embeddings
-        let combinedEmbed = bTextMask[0..., 0..., .newAxis] * textEmbed
-            + bAudioMask[0..., 0..., .newAxis] * featEmbed
-
-        var prefixFeatCond = bAudioFeat[0..., -1, 0..., 0...] // (1, P, D)
-
-        // Initial forward pass
-        var (encOutputs, lmCache) = baseLM(inputsEmbeds: combinedEmbed)
-
-        // Apply FSQ to audio positions
-        encOutputs = fsqLayer(encOutputs) * bAudioMask[0..., 0..., .newAxis]
-            + encOutputs * bTextMask[0..., 0..., .newAxis]
-
-        var lmHidden = encOutputs[0..., -1, 0...] // (1, H)
-
-        // V2: fusion_concat_proj for residual input
-        let residualInput = fusionConcatProj(
-            MLX.concatenated([encOutputs, bAudioMask[0..., 0..., .newAxis] * featEmbed], axis: -1)
+        try await generate(
+            text: text,
+            prompt: prompt(refAudio: refAudio, refText: refText),
+            parameters: parameters(from: generationParameters)
         )
-
-        var (residualOutputs, resCache) = residualLM(inputsEmbeds: residualInput)
-        var residualHidden = residualOutputs[0..., -1, 0...]
-
-        var predFeatSeq: [MLXArray] = []
-        predFeatSeq.reserveCapacity(maxTokens)
-
-        // Generation loop
-        for i in 0 ..< maxTokens {
-            try Task.checkCancellation()
-            // V2: DiT hidden is concatenation
-            let ditH1 = lmToDitProj(lmHidden)
-            let ditH2 = resToDitProj(residualHidden)
-            let ditH = MLX.concatenated([ditH1, ditH2], axis: -1) // (1, 2*H_dit)
-
-            let condIn = prefixFeatCond.transposed(0, 2, 1) // (B, D, P)
-
-            var predFeat = featDecoder.sample(
-                mu: ditH,
-                nTimesteps: inferenceTimesteps,
-                patchSize: patchSize,
-                cond: condIn,
-                cfgValue: cfgValue
-            )
-
-            predFeat = predFeat.transposed(0, 2, 1) // (B, P, D)
-
-            predFeatSeq.append(predFeat[0..., .newAxis, 0..., 0...]) // (B, 1, P, D)
-
-            let currEmbed = featEncoder(predFeat[0..., .newAxis, 0..., 0...])
-            let currEmbedProj = encToLmProj(currEmbed)
-
-            // Stop prediction
-            let stopLogits = stopHead(silu(stopProj(lmHidden)))
-            let stopFlag = MLX.argMax(stopLogits, axis: -1).item(Int.self)
-            if i > minTokens && stopFlag == 1 {
-                break
-            }
-
-            // Autoregressive step
-            let newLmOut: MLXArray
-            (newLmOut, lmCache) = baseLM(inputsEmbeds: currEmbedProj, cache: lmCache)
-
-            lmHidden = newLmOut[0..., -1, 0...]
-            lmHidden = fsqLayer(lmHidden)
-
-            // V2: fusion_concat_proj for residual step
-            let currResInput = fusionConcatProj(
-                MLX.concatenated([lmHidden[0..., .newAxis, 0...], currEmbedProj], axis: -1)
-            )
-            let newResOut: MLXArray
-            (newResOut, resCache) = residualLM(inputsEmbeds: currResInput, cache: resCache)
-            residualHidden = newResOut[0..., -1, 0...]
-
-            prefixFeatCond = predFeat
-
-            eval(lmHidden, residualHidden, predFeat)
-        }
-
-        guard !predFeatSeq.isEmpty else {
-            throw AudioGenerationError.invalidInput("Model generated no audio patches")
-        }
-
-        // Decode
-        let allFeats = MLX.concatenated(predFeatSeq, axis: 1) // (B, Total, P, D)
-        let B = allFeats.dim(0)
-        let allFeatsFlat = allFeats.reshaped(B, -1, featDim) // (B, Total*P, D)
-
-        let audio = audioVAE.decode(allFeatsFlat).flattened()
-        eval(audio)
-        return (audio).materialized()
     }
 
     public func generateStream(
@@ -439,43 +319,11 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         language: String?,
         generationParameters: GenerateParameters
     ) -> AsyncThrowingStream<AudioGeneration, Error> {
-        let (stream, continuation) = AsyncThrowingStream<AudioGeneration, Error>.makeStream()
-
-        let task = Task { @Sendable [weak self] in
-            guard let self else {
-                continuation.finish(throwing: AudioGenerationError.modelNotInitialized("Model deallocated"))
-                return
-            }
-            do {
-                let startTime = Date()
-                let audio = try await self.generate(
-                    text: text, voice: voice, refAudio: refAudio,
-                    refText: refText, language: language,
-                    generationParameters: generationParameters
-                )
-                let generateTime = Date().timeIntervalSince(startTime)
-
-                let info = AudioGenerationInfo(
-                    promptTokenCount: 0,
-                    generationTokenCount: audio.dim(audio.ndim - 1),
-                    prefillTime: 0,
-                    generateTime: generateTime,
-                    tokensPerSecond: Double(audio.dim(audio.ndim - 1)) / max(generateTime, 0.001),
-                    peakMemoryUsage: 0
-                )
-                continuation.yield(.audio(audio))
-                continuation.yield(.info(info))
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
-            }
-        }
-
-        continuation.onTermination = { @Sendable _ in
-            task.cancel()
-        }
-
-        return stream
+        generateStream(
+            text: text,
+            prompt: prompt(refAudio: refAudio, refText: refText),
+            parameters: parameters(from: generationParameters)
+        )
     }
 
     // MARK: - Weight Sanitization

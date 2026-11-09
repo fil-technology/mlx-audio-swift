@@ -2,6 +2,7 @@ import AVFoundation
 import Foundation
 @preconcurrency import MLX
 import MLXAudioCore
+import MLXRandom
 import MLXAudioSTT
 import MLXAudioTTS
 
@@ -50,6 +51,7 @@ enum App {
                 refAudioPath: args.refAudioPath,
                 refText: args.refText,
                 maxTokens: args.maxTokens,
+                seed: args.seed,
                 temperature: args.temperature,
                 topP: args.topP,
                 timestamps: args.timestamps,
@@ -72,6 +74,7 @@ enum App {
         refAudioPath: String?,
         refText: String?,
         maxTokens: Int?,
+        seed: UInt64?,
         temperature: Float?,
         topP: Float?,
         timestamps: Bool,
@@ -117,6 +120,10 @@ enum App {
         }
         if let temperature {
             generationParameters.temperature = temperature
+        }
+        if let seed {
+            generationParameters.seed = seed
+            MLXRandom.seed(seed)
         }
         if let topP {
             generationParameters.topP = topP
@@ -423,6 +430,7 @@ struct CLI {
     let refAudioPath: String?
     let refText: String?
     let maxTokens: Int?
+    let seed: UInt64?
     let temperature: Float?
     let topP: Float?
     let timestamps: Bool
@@ -438,6 +446,7 @@ struct CLI {
         var refAudioPath: String? = nil
         var refText: String? = nil
         var maxTokens: Int? = nil
+        var seed: UInt64? = nil
         var temperature: Float? = nil
         var topP: Float? = nil
         var timestamps = false
@@ -470,6 +479,10 @@ struct CLI {
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 guard let value = Int(v) else { throw CLIError.invalidValue(arg, v) }
                 maxTokens = value
+            case "--seed":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                guard let value = UInt64(v) else { throw CLIError.invalidValue(arg, v) }
+                seed = value
             case "--temperature":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 guard let value = Float(v) else { throw CLIError.invalidValue(arg, v) }
@@ -511,6 +524,7 @@ struct CLI {
             refAudioPath: refAudioPath,
             refText: refText,
             maxTokens: maxTokens,
+            seed: seed,
             temperature: temperature,
             topP: topP,
             timestamps: timestamps,
@@ -524,7 +538,7 @@ struct CLI {
         let exe = (CommandLine.arguments.first as NSString?)?.lastPathComponent ?? "mlx-audio-swift-tts"
         print("""
         Usage:
-          \(exe) --text "Hello world" [--voice conversational_b] [--model <hf-repo>] [--output <path>] [--ref_audio <path>] [--ref_text <string>] [--max_tokens <int>] [--temperature <float>] [--top_p <float>] [--timestamps] [--benchmark]
+          \(exe) --text "Hello world" [--voice conversational_b] [--model <hf-repo>] [--output <path>] [--ref_audio <path>] [--ref_text <string>] [--max_tokens <int>] [--seed <int>] [--temperature <float>] [--top_p <float>] [--timestamps] [--benchmark]
 
         Options:
           -t, --text <string>           Text to synthesize (required if not passed as trailing arg)
@@ -534,6 +548,7 @@ struct CLI {
               --ref_audio <path>       Path to reference audio
               --ref_text <string>      Caption for reference audio
               --max_tokens <int>       Maximum number of tokens to generate (overrides model default)
+              --seed <int>             Seed MLX's random state so a take reproduces
               --temperature <float>    Sampling temperature (overrides model default)
               --top_p <float>          Top-p sampling (overrides model default)
               --timestamps             Emit word timestamps using mlx-community/Qwen3-ForcedAligner-0.6B-4bit
